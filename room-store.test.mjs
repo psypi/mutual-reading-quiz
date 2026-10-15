@@ -31,11 +31,13 @@ test('damaged save fails startup rather than silently deleting all rooms',async 
   await writeFile(file,JSON.stringify([{id:'room',players:[{}]}]));await assert.rejects(openRoomStore(dataDir),/형식/);
 });
 
-test('interrupted grading returns to retry state on restart',async t=>{
+test('older saves preserve invitations and human work without obsolete fields',async t=>{
   const dataDir=await mkdtemp(join(tmpdir(),'quiz-interrupted-'));
   t.after(()=>rm(dataDir,{recursive:true,force:true}));
   const store=await openRoomStore(dataDir);
   await store.mutate(rooms=>rooms.set('room',{id:'room',players:[{status:'processing',answer:'저장된 답안'},{status:'draft'}]}));
   const restored=(await openRoomStore(dataDir)).get('room');
-  assert.equal(restored.players[0].status,'waiting');assert.equal(restored.players[0].answer,'저장된 답안');
+  assert.equal(restored.players[0].status,undefined);assert.equal(restored.players[0].answer,'저장된 답안');
+  assert.equal(restored.startedAt,1);assert.equal(restored.players[1].name,'참가자 2');
+  assert.equal(restored.name,'이전 대결 room');assert.equal(restored.closedAt,null);
 });

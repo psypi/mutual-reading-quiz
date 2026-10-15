@@ -1,100 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm,readFile,mkdir} from 'node:fs/promises';
-import {tmpdir,networkInterfaces} from 'node:os';
+import {mkdtemp,rm,readFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomBytes} from 'node:crypto';
 import {createQuizServer} from './server.mjs';
+const hex=n=>randomBytes(n).toString('hex'),task=i=>({book:`책 ${i}`,range:'1~3장',question:`질문 ${i}`,core:`핵심답 ${i}`,rubric:`채점기준 ${i}`});
+async function fixture(t){const dataDir=await mkdtemp(join(tmpdir(),'reading-game-'));let server,base;async function start(){server=await createQuizServer({dataDir});await new Promise(r=>server.listen(0,'127.0.0.1',r));base=`http://127.0.0.1:${server.address().port}`;}await start();t.after(async()=>{if(server)await new Promise(r=>server.close(r));await rm(dataDir,{recursive:true,force:true});});const post=async(path,input)=>{const r=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input)});return {status:r.status,data:await r.json()};};return {dataDir,post,get base(){return base;},restart:async()=>{await new Promise(r=>server.close(r));await start();}};}
+async function game(f){const c=(await f.post('/api/rooms',{name:'테스트 독서 방'})).data;assert.ok(c.token);assert.equal(c.tokens,undefined);const sessions=[c.session,hex(32)],clients=[c.clientId,hex(16)],id=c.id;const p2=await f.post('/api/room',{id,session:sessions[0],clientId:clients[0],action:'getInvite'});assert.equal(p2.status,200);const tokens=[c.token,p2.data.inviteToken];const join=async i=>f.post('/api/join',{id,token:tokens[i],session:sessions[i],clientId:clients[i]});const act=(i,action,extra={})=>f.post('/api/room',{id,session:sessions[i],clientId:clients[i],action,...extra});assert.equal((await join(0)).status,200);return {id,tokens,sessions,clients,act,join,create:c};}
+async function lobby(g,f){await g.act(0,'setName',{name:'지윤'});await g.join(1);await g.act(1,'setName',{name:'민서'});assert.equal((await g.act(0,'get')).data.lobby.opponentStatus,'상대 입장 완료');await g.act(0,'ready',{ready:true});assert.equal((await g.act(0,'get')).data.phase,'lobby');await g.act(1,'ready',{ready:true});assert.equal((await g.act(0,'get')).data.phase,'lobby');assert.equal((await g.act(0,'startGame')).data.phase,'problems');}
+test('creator enters P1, P1 alone can recover P2 invite, fixed seats reject unknown people and identity changes',async t=>{const f=await fixture(t),g=await game(f);assert.equal((await g.act(0,'get')).data.index,0);assert.equal((await g.act(0,'getInvite')).data.inviteToken,g.tokens[1]);assert.equal((await g.act(1,'getInvite')).status,403);assert.equal((await g.join(1)).status,200);const p2State=(await g.act(1,'get')).data;assert.ok(!JSON.stringify(p2State).includes(g.tokens[0]));assert.ok(!JSON.stringify(p2State).includes(g.tokens[1]));assert.equal((await g.join(0)).data.index,0);assert.equal((await f.post('/api/join',{id:g.id,token:g.tokens[0],session:hex(32),clientId:hex(16)})).data.code,'ROOM_FULL');assert.equal((await g.act(1,'get',{index:0})).status,403);await f.restart();assert.equal((await g.act(0,'get')).status,200);assert.equal((await g.act(0,'getInvite')).data.inviteToken,g.tokens[1]);});
+test('server-controlled lobby start, problem submission and explicit P1 answer transition; private keys stay private',async t=>{const f=await fixture(t),g=await game(f);await g.act(0,'setName',{name:'지윤'});assert.equal((await g.act(0,'ready',{ready:true})).status,409);await g.join(1);await g.act(1,'setName',{name:'민서'});await g.act(0,'ready',{ready:true});await g.act(1,'ready',{ready:true});assert.equal((await g.act(1,'startGame')).status,403);assert.equal((await g.act(0,'startGame')).data.phase,'problems');assert.equal((await g.act(0,'submitAnswer',{answer:'너무 일찍'})).status,409);await g.act(0,'submitTask',{task:task(0)});let b=(await g.act(1,'get')).data;assert.equal(b.publicTasks[0].question,'질문 0');assert.ok(!JSON.stringify(b).includes('핵심답 0'));assert.ok(!JSON.stringify(b).includes('채점기준 0'));assert.equal((await g.act(0,'startAnswers')).status,409);await g.act(1,'submitTask',{task:task(1)});assert.equal((await g.act(1,'startAnswers')).status,403);assert.equal((await g.act(0,'startAnswers')).data.phase,'answers');const answerState=(await g.act(1,'get')).data;assert.equal(answerState.myTask.core,'핵심답 1');assert.ok(!JSON.stringify(answerState).includes('핵심답 0'));});
+test('versioned live drafts persist and stale writes cannot overwrite; only own draft can be changed',async t=>{const f=await fixture(t),g=await game(f);await lobby(g,f);for(let i=0;i<2;i++)await g.act(i,'submitTask',{task:task(i)});await g.act(0,'startAnswers');assert.equal((await g.act(0,'saveAnswerDraft',{draft:'내 초안',revision:300})).status,200);assert.equal((await g.act(1,'get')).data.answers[0].draft,'내 초안');await g.act(0,'saveAnswerDraft',{draft:'최신 초안',revision:400});await g.act(0,'saveAnswerDraft',{draft:'늦게 도착한 오래된 초안',revision:350});assert.equal((await g.act(1,'get')).data.answers[0].draft,'최신 초안');assert.equal((await g.act(1,'saveAnswerDraft',{draft:'위조',revision:999})).status,200);assert.equal((await g.act(0,'get')).data.answers[0].draft,'최신 초안');await f.restart();assert.equal((await g.act(1,'get')).data.answers[0].draft,'최신 초안');});
+test('two answers atomically enter grading, scoring validates integers, hides intermediate ratings, then maps scores to recipients',async t=>{const f=await fixture(t),g=await game(f);await lobby(g,f);for(let i=0;i<2;i++)await g.act(i,'submitTask',{task:task(i)});await g.act(0,'startAnswers');for(let i=0;i<2;i++){await g.act(i,'saveAnswerDraft',{draft:`답변 ${i}`,revision:10+i});const r=await g.act(i,'submitAnswer',{answer:`답변 ${i}`});assert.equal(r.data.phase,i?'grading':'answers');}assert.equal((await g.act(0,'get')).data.peerAnswer,'답변 1');for(const score of [-1,101,2.5,'80',null])assert.equal((await g.act(0,'peer',{score,reason:'근거'})).status,400);const first=await g.act(0,'peer',{score:100,reason:'P2가 P1에게 만점'});assert.equal(first.data.phase,'grading');assert.equal(JSON.stringify(first.data).includes('P2가 P1에게 만점'),false);assert.equal((await g.act(1,'get')).data.results,undefined);const final=await g.act(1,'peer',{score:0,reason:'P1이 P2에게 0점'});assert.equal(final.data.phase,'results');assert.deepEqual(final.data.results.map(x=>x.score),[0,100]);assert.deepEqual(final.data.results.map(x=>x.feedback),['P1이 P2에게 0점','P2가 P1에게 만점']);assert.equal((await g.act(0,'get')).data.finished,true);await f.restart();assert.equal((await g.act(0,'get')).data.phase,'results');});
+test('pre-start disconnect clears readiness; post-start departure preserves data and reconnects the same seat',async t=>{const f=await fixture(t),g=await game(f);await g.act(0,'setName',{name:'P1'});await g.join(1);await g.act(1,'setName',{name:'P2'});await g.act(0,'ready',{ready:true});await g.act(1,'ready',{ready:true});const left=await g.act(1,'leave');assert.deepEqual(left.data.participants.map(x=>x.ready),[false,false]);assert.equal((await g.act(0,'get')).data.lobby.opponentStatus,'상대 초대 대기 중');assert.equal((await g.act(0,'startGame')).status,409);g.clients[1]=hex(16);assert.equal((await g.join(1)).status,200);await g.act(0,'ready',{ready:true});await g.act(1,'ready',{ready:true});await g.act(0,'startGame');await g.act(0,'submitTask',{task:task(0)});await g.act(1,'submitTask',{task:task(1)});await g.act(0,'startAnswers');await g.act(0,'saveAnswerDraft',{draft:'보존 초안',revision:20});await g.act(1,'leave');const waiting=(await g.act(0,'get')).data;assert.equal(waiting.lobby.opponentStatus,'상대 재접속 대기 중');assert.equal(waiting.answers[0].draft,'보존 초안');g.clients[1]=hex(16);await g.join(1);assert.equal((await g.act(1,'get')).data.answers[0].draft,'보존 초안');});
+test('invite helper is served as JavaScript; invalid role, private files and failed saves are safe',async t=>{const f=await fixture(t),g=await game(f);for(const path of ['/.env','/server.mjs','/data/rooms.json','/.git/config'])assert.equal((await fetch(f.base+path)).status,404);const helper=await fetch(f.base+'/invite-url.mjs');assert.equal(helper.status,200);assert.match(helper.headers.get('content-type'),/javascript/);assert.equal((await f.post('/api/join',{id:g.id,token:'bad',session:hex(32),clientId:hex(16)})).data.code,'INVALID_INVITE');assert.equal((await f.post('/api/room',{id:g.id,session:g.sessions[0],clientId:g.clients[0],index:1,action:'get'})).status,403);const file=join(f.dataDir,'rooms.json');await import('node:fs/promises').then(fs=>fs.mkdir(file+'.tmp'));assert.equal((await g.act(0,'setName',{name:'fail'})).status,503);await import('node:fs/promises').then(fs=>fs.rm(file+'.tmp',{recursive:true}));assert.equal((await g.act(0,'get')).data.me.name,'');const saved=JSON.parse(await readFile(file,'utf8'));assert.equal(saved[0].players.length,2);});
 
-test('two invitation seats, concurrent claims, role isolation, shared state and restart',async t=>{
-  const dataDir=await mkdtemp(join(tmpdir(),'reading-quiz-test-'));
-  let server;
-  t.after(async()=>{if(server)await new Promise(r=>server.close(r));await rm(dataDir,{recursive:true,force:true});});
-  const start=async()=>{
-    server=await createQuizServer({dataDir});
-    await new Promise(r=>server.listen(0,'0.0.0.0',r));
-    return `http://127.0.0.1:${server.address().port}`;
-  };
-  let base=await start();
-  const post=async(path,input)=>{
-    const response=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input)});
-    return {status:response.status,data:await response.json()};
-  };
-  const created=await post('/api/rooms',{});assert.equal(created.status,201);
-  const {id,tokens}=created.data;assert.equal(tokens.length,2);assert.notEqual(tokens[0],tokens[1]);
-  const sessions=[randomBytes(32).toString('hex'),randomBytes(32).toString('hex')];
-  const claim=(token,session)=>post('/api/join',{id,token,session});
-  const candidates=[sessions[0],randomBytes(32).toString('hex')];
-  const contenders=await Promise.all(candidates.map(session=>claim(tokens[0],session)));
-  assert.deepEqual(contenders.map(r=>r.status).sort(),[200,409]);
-  sessions[0]=candidates[contenders.findIndex(r=>r.status===200)];
-  assert.equal(contenders.find(r=>r.status===409).data.code,'SEAT_TAKEN');
-  assert.equal((await claim('invalid',sessions[1])).status,403);
-  assert.equal((await claim(tokens[1],sessions[0])).status,409);
-  assert.equal((await claim(tokens[1],sessions[1])).data.index,1);
-  const full=await claim(tokens[0],randomBytes(32).toString('hex'));
-  assert.equal(full.status,409);assert.equal(full.data.code,'ROOM_FULL');
-  assert.equal((await claim(tokens[0],sessions[0])).status,200);
-  const act=(i,action,extra={})=>post('/api/room',{id,session:sessions[i],action,...extra});
-  assert.equal((await post('/api/room',{id,token:tokens[0],action:'get'})).status,403);
-  assert.equal((await post('/api/room',{id,action:'get'})).status,403);
-  assert.equal((await act(0,'get',{index:1,token:tokens[1]})).data.index,0);
-  const task={book:'가상 책',question:'왜 나눴나요?',core:'공동체 생존',rubric:'동기 100점'};
-  assert.equal((await act(0,'setTask',{task,index:1})).status,200);
-  const other=await act(1,'get');assert.equal(other.data.me.task.question,task.question);assert.equal(other.data.myTask,null);
-  const submitted=await act(1,'submit',{answer:'공동체를 위해 나눴습니다.'});assert.equal(submitted.status,200);
-  const shared=await act(0,'get');assert.equal(shared.data.other.answer,'공동체를 위해 나눴습니다.');assert.equal(shared.data.me.answer,undefined);
-  const lan=Object.values(networkInterfaces()).flat().find(a=>a.family==='IPv4'&&!a.internal);
-  if(lan){
-    const response=await fetch(`http://${lan.address}:${server.address().port}/api/room`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,session:sessions[0],action:'get'})});
-    assert.equal(response.status,200);assert.equal((await response.json()).other.answer,shared.data.other.answer);
-  }
-  assert.equal((await act(0,'peer',{score:80,reason:'동기 설명'})).status,200);
-  assert.equal((await act(1,'get')).data.me.peer.score,80);
-  const payload=JSON.stringify(shared.data);assert.ok(!payload.includes(tokens[0]));assert.ok(!payload.includes(sessions[1]));
-  await new Promise(r=>server.close(r));server=null;base=await start();
-  assert.equal((await act(0,'get')).data.other.answer,'공동체를 위해 나눴습니다.');
-  assert.equal((await claim(tokens[1],randomBytes(32).toString('hex'))).data.code,'ROOM_FULL');
-  assert.equal((await claim(tokens[1],sessions[1])).status,200);
-});
+test('request origin must match the host, while same-origin room creation works',async t=>{const f=await fixture(t);const send=origin=>fetch(f.base+'/api/rooms',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify({name:'출처 테스트 방'})});const denied=await send('https://attacker.example');assert.equal(denied.status,403);assert.match((await denied.json()).message,/다른 사이트/);const allowed=await send(f.base);assert.equal(allowed.status,201);assert.equal(typeof (await allowed.json()).session,'string');});
 
-test('private files, cross-site requests and upstream secret errors stay out of browser responses',async t=>{
-  const dataDir=await mkdtemp(join(tmpdir(),'quiz-security-'));
-  const marker='fake-test-secret-not-a-real-api-key';
-  let useFakeKey=false;
-  const server=await createQuizServer({dataDir,getApiKey:()=>useFakeKey?marker:undefined,grader:async(task,key)=>{assert.equal(key,marker);throw new Error(`upstream error ${key}`);}});
-  await new Promise(r=>server.listen(0,'127.0.0.1',r));
-  t.after(async()=>{await new Promise(r=>server.close(r));await rm(dataDir,{recursive:true,force:true});});
-  const base=`http://127.0.0.1:${server.address().port}`;
-  const post=async(path,input,headers={})=>{
-    const response=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(input)});
-    const text=await response.text();assert.ok(!text.includes(marker));return {status:response.status,data:JSON.parse(text)};
-  };
-  for(const path of ['/.env','/server.mjs','/grading.mjs','/data/rooms.json','/.git/config','/%2e%2e/.env'])assert.equal((await fetch(base+path)).status,404);
-  for(const path of ['/','/app.js','/style.css','/healthz']){
-    const response=await fetch(base+path);assert.equal(response.status,200);
-    assert.equal(response.headers.get('referrer-policy'),'no-referrer');
-    assert.equal(response.headers.get('x-content-type-options'),'nosniff');
-    assert.ok(response.headers.get('content-security-policy').includes("frame-ancestors 'none'"));
-    assert.ok(!(await response.text()).includes(marker));
-  }
-  assert.equal((await post('/api/rooms',{}, {Origin:'https://other.example'})).status,403);
-  assert.equal((await post('/api/join',null)).status,400);
-  const {id,tokens}= (await post('/api/rooms',{}, {Origin:base})).data;
-  const sessions=[randomBytes(32).toString('hex'),randomBytes(32).toString('hex')];
-  // A failed server save must not consume a one-time invitation.
-  await mkdir(join(dataDir,'rooms.json.tmp'));
-  assert.equal((await post('/api/join',{id,token:tokens[0],session:sessions[0]})).status,503);
-  await rm(join(dataDir,'rooms.json.tmp'),{recursive:true});
-  for(let i=0;i<2;i++)assert.equal((await post('/api/join',{id,token:tokens[i],session:sessions[i]})).status,200);
-  const act=(i,action,extra={})=>post('/api/room',{id,session:sessions[i],action,...extra});
-  assert.equal((await post('/api/room',{id,token:tokens[0],action:'setTask',task:{}})).status,403);
-  const task={question:'왜 나눴나요?',core:'공동체 생존',rubric:'동기 100점',untrustedExtra:marker};
-  assert.equal((await act(0,'setTask',{task})).status,200);
-  assert.equal((await act(1,'submit',{answer:'공동체를 위해'})).status,200);
-  assert.equal((await act(1,'grade')).status,503);
-  assert.equal((await act(1,'get')).data.me.status,'ready');
-  useFakeKey=true;assert.equal((await act(1,'grade')).status,502);
-  assert.equal((await act(1,'get')).data.me.status,'error');
-  assert.ok(!(await readFile(join(dataDir,'rooms.json'),'utf8')).includes(marker));
-});
+test('only P1 can list and close named rooms; old rooms and saved work survive',async t=>{const f=await fixture(t),first=await game(f),second=await game(f);assert.equal(first.create.name,'테스트 독서 방');assert.equal((await f.post('/api/rooms',{name:' '})).status,400);await first.join(1);await first.act(0,'setName',{name:'지윤'});await first.act(0,'leave');const credentials=[{id:first.id,token:first.tokens[0],session:first.sessions[0]},{id:first.id,token:first.tokens[1],session:first.sessions[1]},{id:second.id,token:second.tokens[0],session:second.sessions[0]}];const listed=await f.post('/api/rooms/list',{credentials});assert.equal(listed.status,200);assert.deepEqual(listed.data.rooms.map(room=>room.id).sort(),[first.id,second.id].sort());assert.ok(!JSON.stringify(listed.data).includes(first.tokens[1]));assert.equal((await f.post('/api/rooms/list',{credentials:[credentials[1]]})).data.rooms.length,0);assert.equal((await first.act(1,'closeRoom')).status,403);assert.equal((await first.act(0,'closeRoom')).status,200);assert.equal((await first.act(1,'get')).data.code,'ROOM_CLOSED');assert.equal((await first.join(1)).data.code,'ROOM_CLOSED');assert.equal((await f.post('/api/rooms/list',{credentials})).data.rooms.length,1);await f.restart();assert.equal((await first.act(0,'get')).data.code,'ROOM_CLOSED');assert.equal((await second.act(0,'get')).data.name,'테스트 독서 방');});

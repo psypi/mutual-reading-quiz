@@ -1,1 +1,74 @@
-<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>상호 독서 퀴즈</title><link rel="stylesheet" href="/style.css"><body><main><header><small>READ · THINK · CHALLENGE</small><h1>상호 독서 퀴즈</h1><p>서로의 질문으로 읽고, 두 가지 시선으로 평가합니다.</p></header><div id="notice" role="status"></div><section id="start"><h2>두 사람의 독서 대결</h2><p>참가 링크를 각각 열어 출제하고 답안을 제출하세요.</p><button id="create">대결 만들기</button><div id="links"></div></section><div id="game" hidden><section><h2>상대에게 출제</h2><p>확정 후 수정할 수 없습니다. 기준의 배점 합계는 100점으로 작성하세요.</p><button id="example">가상 예시 채우기</button><form id="task"><label>책·독서 범위<input name="book" maxlength="200" required></label><label>질문<textarea name="question" required maxlength="700"></textarea></label><label>모범 답안의 핵심<textarea name="core" required maxlength="1000"></textarea></label><label>채점 기준·배점<textarea name="rubric" required maxlength="1000"></textarea></label><button>출제 확정</button></form></section><section><h2>내 답안</h2><p id="question">상대의 출제를 기다립니다.</p><form id="answer"><label>응시자 답변<textarea name="answer" required maxlength="2000"></textarea></label><button>답안 제출</button></form><p id="state"></p><button id="grade">AI 채점 / 재시도</button><div id="ai"></div></section><section><h2>상대 답안 평가</h2><p>내가 확정한 채점 기준으로 평가하세요. 평가 전 AI 결과는 공개되지 않습니다.</p><pre id="peerAnswer"></pre><form id="peer"><label>총점 (0~100)<input name="score" type="number" min="0" max="100" step="1" required></label><label>항목별 점수와 평가 근거<textarea name="reason" required maxlength="3000"></textarea></label><button>상대 평가 확정</button></form></section><section><h2>대결 결과</h2><p id="result">AI와 상대 평가가 모두 완료되면 공개됩니다.</p></section><button id="refresh">상태 새로고침</button></div><footer>Groq 무료 티어 · AI 50% + 상대 50% · 동점은 무승부<br>초기 검증에는 개인정보 없는 예시 답안을 사용하세요.</footer></main><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#173f35">
+  <title>독서 대결장 · 서로의 읽기를 묻다</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">冊</span><span>둘이 읽고, 서로 묻다</span><span class="pill">1 : 1 독서 게임</span></div>
+    <div class="hero-copy"><p class="eyebrow">READ · QUESTION · DISCUSS</p><h1>독서 대결장<span class="gold">.</span></h1><p>좋은 질문 하나로 시작하는 두 사람의 독서.<br>서로 다른 책을 펼치고, 서로의 생각에 답해 보세요.</p></div>
+    <div class="hero-note"><span>오늘의 규칙</span><strong>질문은 깊게, 평가는 다정하게.</strong><p>각자 출제하고 상대가 답합니다.<br>두 사람의 평가가 끝나면 결과를 함께 엽니다.</p></div>
+  </header>
+  <nav id="stage-nav" aria-label="대결 진행 단계" hidden><ol id="steps"><li aria-current="step"><span>01</span>대기실</li><li><span>02</span>문제 만들기</li><li><span>03</span>답변</li><li><span>04</span>평가</li><li><span>05</span>결과</li></ol></nav>
+  <div id="notice" role="status" aria-live="polite" tabindex="-1"></div>
+  <section id="start" class="card welcome">
+    <div><p class="eyebrow">새로운 만남, 새로운 질문</p><h2>이름을 붙여 독서 대결 방을 열어요</h2><p class="muted">방을 만들면 P1으로 바로 입장합니다. P2에게 방 초대 링크를 보내 주세요.</p><p class="invite-address-help">다른 기기와 함께하려면 두 사람 모두 같은 서버 주소로 접속하세요. 초대 링크는 방을 만든 주소를 사용합니다. localhost 링크는 만든 기기에서만 열립니다.</p></div>
+    <form id="create-form" class="create-form"><label>방 이름<input id="room-name-input" name="name" required maxlength="60" placeholder="예: 가을밤 독서 대결"></label><button id="create" type="submit">방 만들기 <span aria-hidden="true">↗</span></button></form>
+  </section>
+  <section id="my-rooms" class="card" hidden><div class="card-heading"><div><p class="eyebrow">P1 전용</p><h2>내가 만든 방</h2></div></div><p class="muted">이 브라우저에서 만든 방만 표시됩니다. 방을 해체하면 초대 링크로 다시 입장할 수 없습니다.</p><div id="room-list" class="room-list"></div></section>
+  <div id="game" hidden>
+    <div class="section-heading room-heading"><div><p class="eyebrow">현재 대결 방</p><h2 id="room-name">독서 대결</h2></div><div class="room-actions"><button id="refresh" class="secondary" type="button">상태 새로고침</button><button id="close-room" class="secondary danger" type="button" hidden>방 해체</button><button id="leave" class="secondary" type="button">앱 종료</button></div></div>
+    <div id="participants" class="player-grid"></div>
+    <section class="card" id="lobby-card">
+      <div class="card-heading"><span class="section-number">01</span><div><p class="eyebrow">대기실</p><h2>어떤 이름으로 함께할까요?</h2></div></div>
+      <form id="profile" class="name-form"><label>참가자 이름<input name="name" required maxlength="24" autocomplete="nickname" placeholder="함께 읽을 때 사용할 이름"></label><button>이름 저장</button></form>
+      <p class="form-status" id="profile-status" role="status"></p>
+      <div class="lobby-panel">
+        <div><p class="eyebrow">서버 접속 확인</p><h3 id="opponent-status" aria-live="polite">상대 초대 대기 중</h3><p id="ready-status" class="muted" aria-live="polite">두 사람이 입장하고 준비를 완료하면 시작합니다.</p></div>
+        <div class="lobby-actions"><button id="ready" type="button" disabled>준비 완료</button><button id="start-game" type="button" disabled>게임 시작</button></div>
+      </div>
+      <div id="invite-panel" class="invite-panel" hidden><div><p class="eyebrow">P2 전용 초대 링크</p><p class="muted">현재 접속 주소 <strong id="invite-origin"></strong>를 사용합니다. 다른 기기는 Mac의 LAN 주소로 접속해야 합니다.</p></div><div class="invite-link-row"><input id="opponent-link" readonly aria-label="P2 초대 링크"><button id="copy-opponent" type="button" disabled>링크 복사</button></div><p id="invite-status" class="form-status" role="status" aria-live="polite">초대 링크를 확인하고 있어요.</p></div>
+      <p class="presence-help">접속 상태를 2초마다 확인합니다. 시작 전 연결이 끊기면 준비가 해제되고, 시작 후에는 제출한 내용을 보존합니다.</p>
+    </section>
+      <div id="play-area" hidden>
+    <section class="card" id="task-card">
+      <div class="card-heading"><span class="section-number">02</span><div><p class="eyebrow">내가 출제자</p><h2>상대에게 건넬 질문</h2></div><span class="badge">기준·핵심 답은 나만 보기</span></div>
+      <p class="muted">상대가 읽을 책과 범위를 정하고 질문을 만들어 주세요. 제출하면 수정할 수 없습니다.</p>
+      <button id="example" type="button" class="text-button">가상 독서 예시 채우기 ↗</button>
+      <form id="task">
+        <div class="field-grid"><label>책 제목<input name="book" maxlength="200" required placeholder="예: 씨앗을 나눈 마을"></label><label>독서 범위<input name="range" maxlength="200" required placeholder="예: 1~3장, 10~35쪽"></label></div>
+        <label>상대에게 할 질문<textarea name="question" required maxlength="1500" placeholder="책의 어떤 생각을 함께 나누고 싶나요?"></textarea></label>
+        <div class="private-box"><p class="private-title">출제자 전용 메모</p><p class="muted">아래 내용은 상대에게 전송되지 않습니다. 결과 공개 후에도 나만 볼 수 있어요.</p><label>핵심 답<textarea name="core" required maxlength="2000" placeholder="답변에 담겼으면 하는 핵심 내용을 정리하세요."></textarea></label><label>채점 기준 · 총 100점<textarea name="rubric" required maxlength="2000" placeholder="예: 핵심 이해 40점 / 책 속 근거 40점 / 설명의 명확성 20점"></textarea></label></div>
+        <div class="form-footer"><p id="task-progress" class="muted">상대에게는 책·범위·질문만 공개됩니다.</p><button>문제 제출하기</button></div>
+      </form><p class="form-status" id="task-status" role="status"></p>
+      <div id="start-answers-panel" class="lobby-panel" hidden><p id="task-submit-status" aria-live="polite"></p><button id="start-answers" type="button" disabled>답변하기</button></div>
+    </section>
+    <section class="card" id="answer-card">
+      <div class="card-heading"><span class="section-number">03</span><div><p class="eyebrow">이번엔 내가 답할 차례</p><h2>책을 읽고, 내 생각을 답해요</h2></div></div>
+      <div class="reading-prompt"><p class="eyebrow" id="reading-book">상대의 질문을 기다리는 중</p><h3 id="question">두 사람이 문제를 제출하면 답변할 수 있어요.</h3></div>
+      <div class="answer-grid" id="answer-grid"></div><p class="form-status" id="answer-status" role="status"></p>
+    </section>
+    <section class="card" id="peer-card">
+      <div class="card-heading"><span class="section-number">04</span><div><p class="eyebrow">사람이 직접 평가해요</p><h2>상대의 생각에 피드백을 남겨요</h2></div></div>
+      <p class="muted">내가 낸 문제와 기준에 맞춰 평가해 주세요. 양쪽 평가가 끝날 때까지 상대가 준 점수는 공개되지 않습니다.</p>
+      <details id="my-criteria"><summary>내 질문 · 핵심 답 · 채점 기준 확인</summary><div id="criteria-content" class="prose"></div></details>
+      <div class="reading-prompt"><p class="eyebrow">상대가 제출한 답변</p><p id="peerAnswer" class="prose">아직 답변이 도착하지 않았어요.</p></div>
+      <form id="peer"><label class="score-field">상대 답변 점수 · 100점 만점<input name="score" type="number" inputmode="numeric" min="0" max="100" step="1" required placeholder="0~100"></label><label>피드백<textarea name="reason" required maxlength="3000" placeholder="잘 읽어낸 점과 더 생각해 보면 좋을 점을 알려 주세요."></textarea></label><div class="form-footer"><p class="muted">평가는 한 번만 확정할 수 있습니다.</p><button>평가 확정하기</button></div></form><p class="form-status" id="peer-status" role="status"></p>
+    </section>
+    <section class="card result-card" id="result-card">
+      <div class="card-heading"><span class="section-number">05</span><div><p class="eyebrow">두 사람의 읽기가 만나는 순간</p><h2>대결 결과</h2></div></div>
+      <p id="result" class="result-intro">두 사람이 평가를 마치면 점수와 피드백을 함께 공개합니다.</p><div id="results" class="result-grid"></div>
+    </section>
+    </div>
+  </div>
+  <section id="closed-room" class="card" hidden><p class="eyebrow">방이 종료되었어요</p><h2>이 방은 해체되었습니다.</h2><p>방을 만든 사람이 종료하여 더 이상 입장하거나 진행할 수 없습니다.</p><button id="closed-home" type="button">홈으로 돌아가기</button></section>
+  <footer><strong>독서 대결장</strong><span>책은 달라도, 생각은 함께 깊어지니까.</span><p>두 사람의 직접 출제 · 직접 평가 · 100점 만점</p></footer>
+</main>
+</body>
+</html>

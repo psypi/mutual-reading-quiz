@@ -9,7 +9,20 @@ export async function openRoomStore(dataDir){
   try{saved=JSON.parse(await readFile(file,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
   if(!Array.isArray(saved)||saved.some(r=>!r.id||!Array.isArray(r.players)||r.players.length!==2))throw new Error('대결 저장 파일 형식이 올바르지 않습니다. 백업을 확인하세요.');
   let rooms=new Map(saved.map(r=>[r.id,r]));
-  for(const room of rooms.values())for(const p of room.players)if(p.status==='processing')p.status='waiting';
+  // Preserve invitations and human work from older saves; discard obsolete derived fields.
+  for(const room of rooms.values()){
+    room.name=typeof room.name==='string'&&room.name.trim()?room.name.trim():`이전 대결 ${room.id.slice(0,6)}`;
+    room.createdAt=Number.isSafeInteger(room.createdAt)?room.createdAt:null;
+    room.closedAt=Number.isSafeInteger(room.closedAt)?room.closedAt:null;
+    // Existing matches with submitted work are already in progress; never lock that work away.
+    room.startedAt=room.startedAt??(room.players.some(p=>p.task||p.answer||p.peer)?1:null);
+    room.phase=room.phase||(!room.startedAt?'lobby':room.players.every(p=>p.peer)?'results':room.players.every(p=>p.answer)?'grading':room.players.every(p=>p.task)?'answers':'problems');
+    room.players=room.players.map((p,i)=>({
+    token:p.token,session:p.session,name:p.name||(room.startedAt!==null?`참가자 ${i+1}`:''),task:p.task?Object.fromEntries(['book','range','question','core','rubric'].map(k=>[k,p.task[k]||''])):null,
+    draftAnswer:typeof p.draftAnswer==='string'?p.draftAnswer:'',draftRevision:Number.isSafeInteger(p.draftRevision)?p.draftRevision:0,
+    answer:p.answer||null,peer:p.peer?{score:p.peer.score,reason:p.peer.reason}:null,
+    }));
+  }
   let queue=Promise.resolve();
   return {
     get:id=>rooms.get(id),

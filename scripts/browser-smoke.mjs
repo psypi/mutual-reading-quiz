@@ -1,52 +1,37 @@
 import assert from 'node:assert/strict';
-const base=process.env.QUIZ_BASE_URL||'http://127.0.0.1:3000';
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-async function connection(url){
-  const ws=new WebSocket(url);await new Promise(r=>ws.addEventListener('open',r,{once:true}));
-  let seq=0;const pending=new Map(),errors=[];
-  ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id){pending.get(m.id)?.(m);pending.delete(m.id);}else if(m.method==='Runtime.exceptionThrown')errors.push(m);});
-  const call=(method,params={})=>new Promise((resolve,reject)=>{const id=++seq;pending.set(id,m=>m.error?reject(m.error):resolve(m.result));ws.send(JSON.stringify({id,method,params}));});
-  const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));return r.result.value;};
-  return {call,evaluate,errors,close:()=>ws.close()};
-}
-async function browser(port){
-  const meta=await(await fetch(`http://127.0.0.1:${port}/json/version`)).json();
-  const root=await connection(meta.webSocketDebuggerUrl);
-  const {browserContextId}=await root.call('Target.createBrowserContext');
-  const {targetId}=await root.call('Target.createTarget',{url:'about:blank',browserContextId});
-  const tabs=await(await fetch(`http://127.0.0.1:${port}/json`)).json();
-  const page=await connection(tabs.find(t=>t.id===targetId).webSocketDebuggerUrl);
-  await page.call('Runtime.enable');await page.call('Page.enable');
-  const navigate=async url=>{await page.call('Page.navigate',{url});await sleep(600);};
-  return {...page,navigate,dispose:async()=>{page.close();await root.call('Target.disposeBrowserContext',{browserContextId});root.close();}};
-}
-const firstPort=Number(process.env.CHROME_A_PORT||9223),secondPort=Number(process.env.CHROME_B_PORT||9224);
-const a=await browser(firstPort),b=await browser(secondPort),c=await browser(firstPort);
+import {mkdir,writeFile} from 'node:fs/promises';
+import {join} from 'node:path';
+const base=process.env.QUIZ_BASE_URL||'http://127.0.0.1:3000',sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function connection(url){const ws=new WebSocket(url);await new Promise((resolve,reject)=>{ws.addEventListener('open',resolve,{once:true});ws.addEventListener('error',reject,{once:true});});let seq=0;const pending=new Map(),errors=[];ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id){pending.get(m.id)?.(m);pending.delete(m.id);}else if(m.method==='Runtime.exceptionThrown')errors.push(m);});const call=(method,params={})=>new Promise((resolve,reject)=>{const id=++seq;pending.set(id,m=>m.error?reject(m.error):resolve(m.result));ws.send(JSON.stringify({id,method,params}));});const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true,userGesture:true});if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));return r.result.value;};return {call,evaluate,errors,close:()=>ws.close()};}
+async function browser(port){const meta=await(await fetch(`http://127.0.0.1:${port}/json/version`)).json(),root=await connection(meta.webSocketDebuggerUrl),{browserContextId}=await root.call('Target.createBrowserContext'),{targetId}=await root.call('Target.createTarget',{url:'about:blank',browserContextId}),tabs=await(await fetch(`http://127.0.0.1:${port}/json`)).json(),page=await connection(tabs.find(t=>t.id===targetId).webSocketDebuggerUrl);await page.call('Runtime.enable');await page.call('Page.enable');await root.call('Browser.grantPermissions',{browserContextId,origin:base,permissions:['clipboardReadWrite','clipboardSanitizedWrite']});const navigate=async url=>{await page.call('Page.navigate',{url});await waitFor(page,"document.readyState==='complete'",10000);};return {...page,navigate,dispose:async()=>{page.close();await root.call('Target.disposeBrowserContext',{browserContextId});root.close();}};}
+async function waitFor(page,expression,timeout=12000){for(let i=0;i<timeout/75;i++){if(await page.evaluate(expression))return;await sleep(75);}throw new Error('Timed out: '+expression);}
+async function name(page,value){await page.evaluate(`(()=>{const input=document.querySelector('#profile input');input.focus();input.value=${JSON.stringify(value)};document.querySelector('#profile button').click()})()`);try{await waitFor(page,`document.getElementById('profile-status').textContent.includes(${JSON.stringify(value)})`);}catch(error){const state=await page.evaluate("({notice:document.getElementById('notice').textContent,status:document.getElementById('profile-status').textContent,phase:document.getElementById('game').hidden,link:location.href,input:document.querySelector('#profile input')?.value,buttonDisabled:document.querySelector('#profile button')?.disabled,valid:document.getElementById('profile')?.checkValidity()})");throw new Error(`${error.message}; profile state: ${JSON.stringify(state)}`);}}
+const a=await browser(Number(process.env.CHROME_A_PORT||9223)),b=await browser(Number(process.env.CHROME_B_PORT||9224)),outsider=await browser(Number(process.env.CHROME_A_PORT||9223)),artifactDir=process.env.QUIZ_SCREENSHOTS;if(artifactDir)await mkdir(artifactDir,{recursive:true});
+async function capture(page,name){if(!artifactDir)return;const shot=await page.call('Page.captureScreenshot',{format:'png'});await writeFile(join(artifactDir,name),Buffer.from(shot.data,'base64'));}
 try{
-  await a.navigate(base+'/');await a.evaluate('document.getElementById("create").click()');await sleep(500);
-  const links=await a.evaluate('[...document.querySelectorAll("#links a")].map(a=>a.href)');assert.equal(links.length,2);
-  await a.navigate(links[0]);await b.navigate(links[1]);await sleep(2500);
-  assert.equal(await a.evaluate('document.getElementById("participants").textContent'),'참가자 1 · 참가 2/2명');
-  assert.equal(await b.evaluate('document.getElementById("participants").textContent'),'참가자 2 · 참가 2/2명');
-  // Submit participant 1's task and wait for participant 2's polling, without manual refresh.
-  await a.evaluate('document.getElementById("example").click();document.getElementById("task").requestSubmit()');await sleep(2500);
-  assert.ok((await b.evaluate('document.getElementById("question").textContent')).includes('씨앗을 나눈 이유'));
-  assert.equal(await b.evaluate('document.querySelector("#answer button").disabled'),false);
-  assert.equal(await b.evaluate('document.querySelector("#task button").disabled'),false);
-  await b.evaluate('document.querySelector("#answer textarea").value="공동체의 생존을 위해 씨앗을 나누고 식량 부족을 해결했습니다.";document.getElementById("answer").requestSubmit()');await sleep(2500);
-  assert.ok((await a.evaluate('document.getElementById("peerAnswer").textContent')).includes('공동체의 생존'));
-  await a.evaluate('document.querySelector("#peer input").value="85";document.querySelector("#peer textarea").value="공동체 동기를 설명했습니다.";document.getElementById("peer").requestSubmit()');await sleep(2500);
-  const peer=await b.evaluate('fetch("/api/room",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...identity,action:"get"})}).then(r=>r.json()).then(d=>d.me.peer)');
-  assert.equal(peer.score,85);
-  await c.navigate(links[0]);
-  assert.ok((await c.evaluate('document.getElementById("notice").textContent')).includes('두 참가자 자리가 모두 찼습니다'));
-  assert.equal(await c.evaluate('document.getElementById("game").hidden'),true);
-  // The second browser cannot enter participant 1's occupied invitation.
-  await b.navigate(links[0]);assert.ok((await b.evaluate('document.getElementById("notice").textContent')).includes('참가할 수 없습니다'));
-  await b.navigate(links[1]);assert.equal(await b.evaluate('document.getElementById("game").hidden'),false);
-  await a.call('Page.reload');await sleep(700);
-  assert.equal(await a.evaluate('document.getElementById("game").hidden'),false);
-  assert.ok((await a.evaluate('document.getElementById("peerAnswer").textContent')).includes('공동체의 생존'));
-  assert.equal(a.errors.length+b.errors.length+c.errors.length,0);
-  console.log('PASS: two independent Chrome processes share task, answer and peer evaluation; third browser and wrong-role invite rejected; original browser reload/re-entry succeeds; no JS errors.');
-}finally{await Promise.all([a.dispose(),b.dispose(),c.dispose()]);}
+  await a.call('Emulation.setDeviceMetricsOverride',{width:1280,height:1100,deviceScaleFactor:1,mobile:false});await a.navigate(base+'/');assert.equal(await a.evaluate("document.getElementById('game').hidden"),true);assert.equal(await a.evaluate("document.getElementById('start').hidden"),false);await a.evaluate("document.getElementById('room-name-input').value='첫 번째 독서 방';document.getElementById('create').click()");await waitFor(a,"document.getElementById('game').hidden===false");await waitFor(a,"document.getElementById('participants').children.length===2");assert.equal(await a.evaluate("document.getElementById('room-name').textContent"),'첫 번째 독서 방');
+  assert.equal(await a.evaluate("document.getElementById('participants').children.length"),2);await waitFor(a,"document.getElementById('opponent-link').value.includes('#room=')");const p2=await a.evaluate("document.getElementById('opponent-link').value"),p1=await a.evaluate('location.href');assert.notEqual(p1,p2);assert.equal(new URL(p2).origin,new URL(base).origin);await a.evaluate("document.getElementById('copy-opponent').click()");await waitFor(a,"document.getElementById('notice').textContent.includes('복사했어요')");assert.equal(await a.evaluate('navigator.clipboard.readText()'),p2);await a.call('Page.reload');await waitFor(a,`document.getElementById('opponent-link').value===${JSON.stringify(p2)}`);
+  if(process.env.QUIZ_INVITE_ONLY!=='1'){
+  await name(a,'지윤');await b.navigate(p2);await name(b,'민서');await waitFor(a,"document.getElementById('opponent-status').textContent==='상대 입장 완료'");await a.evaluate("document.getElementById('ready').click()");await waitFor(a,"document.getElementById('ready').getAttribute('aria-pressed')==='true'");assert.equal(await a.evaluate("document.getElementById('start-game').disabled"),true);
+  await a.call('Emulation.setDeviceMetricsOverride',{width:390,height:900,deviceScaleFactor:1,mobile:true});assert.equal(await a.evaluate('document.documentElement.scrollWidth<=innerWidth'),true);assert.ok(await a.evaluate("document.getElementById('ready').getBoundingClientRect().height>=48"));await capture(a,'02-lobby-mobile.png');await a.call('Emulation.setDeviceMetricsOverride',{width:1280,height:1100,deviceScaleFactor:1,mobile:false});
+  await b.evaluate("document.getElementById('ready').click()");await waitFor(a,"document.getElementById('start-game').disabled===false");await a.evaluate("document.getElementById('start-game').click()");for(const page of [a,b])await waitFor(page,"document.getElementById('task-card').hidden===false");
+  const tasks=[{book:'씨앗을 나눈 마을',range:'전체',question:'왜 씨앗을 나눴나요?',core:'P1만 보는 핵심',rubric:'P1만 보는 기준'},{book:'편지를 남긴 도서관',range:'2장',question:'왜 편지를 남겼나요?',core:'P2만 보는 핵심',rubric:'P2만 보는 기준'}];
+  for(const [i,page]of [[0,a],[1,b]]){await page.evaluate(`(()=>{const f=document.querySelector('#task');for(const [k,v] of Object.entries(${JSON.stringify(tasks[i])}))f.elements[k].value=v;f.querySelector('button').click()})()`);await waitFor(page,"document.getElementById('task-status').textContent.includes('문제 제출 완료')");}
+  await waitFor(a,"document.getElementById('start-answers').disabled===false");await a.evaluate("document.getElementById('start-answers').click()");for(const page of [a,b])await waitFor(page,"document.getElementById('answer-card').hidden===false");assert.ok(!(await a.evaluate('document.body.textContent')).includes('P2만 보는 핵심'));
+  await a.evaluate("document.querySelector('#answer-0 textarea').value='P1 초안은 서버 저장';document.querySelector('#answer-0 textarea').dispatchEvent(new Event('input',{bubbles:true}))");await waitFor(b,"document.querySelector('#answer-0 textarea')?.value==='P1 초안은 서버 저장'");await a.call('Page.reload');await waitFor(a,"document.querySelector('#answer-0 textarea')?.value==='P1 초안은 서버 저장'");
+  await a.evaluate("document.querySelector('#answer-0 button').click()");await waitFor(a,"document.querySelector('#answer-0 button').textContent.includes('완료')");assert.equal(await a.evaluate("document.querySelector('#answer-0 textarea').readOnly"),true);
+  await b.evaluate("document.querySelector('#answer-1 textarea').value='P2 답안';document.querySelector('#answer-1 textarea').dispatchEvent(new Event('input',{bubbles:true}))");await waitFor(a,"document.querySelector('#answer-1 textarea').value==='P2 답안'");await b.evaluate("document.querySelector('#answer-1 button').click()");await waitFor(a,"document.getElementById('peer-card').hidden===false");
+  assert.ok((await a.evaluate("document.getElementById('criteria-content').textContent")).includes('P1만 보는 기준'));assert.ok(!(await a.evaluate("document.getElementById('peerAnswer').textContent")).includes('P1 초안'));
+  for(const [page,score,feedback]of [[a,'100','P1이 P2 답안을 평가'],[b,'0','P2가 P1 답안을 평가']]){await page.evaluate(`(()=>{const f=document.getElementById('peer');f.elements.score.value=${JSON.stringify(score)};f.elements.reason.value=${JSON.stringify(feedback)};f.elements.score.dispatchEvent(new Event('input',{bubbles:true}));f.elements.reason.dispatchEvent(new Event('input',{bubbles:true}));f.querySelector('button').click()})()`);await waitFor(page,"document.getElementById('peer-status').textContent.includes('채점 완료')||document.getElementById('result-card').hidden===false");}
+  for(const page of [a,b]){await waitFor(page,"document.getElementById('result-card').hidden===false");const state=await page.evaluate("({results:document.getElementById('results').textContent,result:document.getElementById('result').textContent})");assert.ok(state.results.includes('0'));assert.ok(state.results.includes('100'));assert.equal(state.result,page===a?'패배':'승리');}await capture(a,'03-results.png');
+  await outsider.navigate(p1);assert.ok((await outsider.evaluate("document.getElementById('notice').textContent")).includes('두 참가자 자리가 모두 찼습니다'));assert.equal(await outsider.evaluate("document.getElementById('game').hidden"),true);assert.equal(a.errors.length+b.errors.length+outsider.errors.length,0);
+  await a.evaluate("window.confirm=message=>{window.lastConfirm=message;return false};document.getElementById('leave').click()");assert.equal(await a.evaluate('window.lastConfirm'),'정말 나가나용?');assert.equal(await a.evaluate("document.getElementById('game').hidden"),false);
+  await a.evaluate("window.confirm=()=>true;document.getElementById('leave').click()");await waitFor(a,"document.getElementById('start').hidden===false&&document.querySelectorAll('#room-list .room-entry').length===1");
+  await b.evaluate("window.confirm=message=>{window.lastConfirm=message;return false};document.getElementById('leave').click()");assert.equal(await b.evaluate('window.lastConfirm'),'정말 나가나용?');assert.equal(await b.evaluate("document.getElementById('game').hidden"),false);
+  await b.evaluate("window.confirm=()=>true;document.getElementById('leave').click()");await waitFor(b,"document.getElementById('start').hidden===false");assert.equal(await b.evaluate("document.getElementById('my-rooms').hidden"),true);
+  await b.navigate(p2);await waitFor(b,"document.getElementById('game').hidden===false");await a.evaluate("document.querySelector('#room-list .room-entry button').click()");await waitFor(a,"document.getElementById('game').hidden===false");assert.equal(await a.evaluate("document.getElementById('room-name').textContent"),'첫 번째 독서 방');
+  await a.evaluate("window.confirm=()=>true;document.getElementById('leave').click()");await waitFor(a,"document.querySelectorAll('#room-list .room-entry').length===1");await a.evaluate("document.getElementById('room-name-input').value='두 번째 독서 방';document.getElementById('create').click()");await waitFor(a,"document.getElementById('room-name').textContent==='두 번째 독서 방'");await a.evaluate("window.confirm=()=>true;document.getElementById('leave').click()");await waitFor(a,"document.querySelectorAll('#room-list .room-entry').length===2");
+  await a.evaluate("window.confirm=()=>true;[...document.querySelectorAll('#room-list .room-entry')].find(card=>card.querySelector('h3').textContent==='첫 번째 독서 방').querySelector('.danger').click()");await waitFor(a,"document.querySelectorAll('#room-list .room-entry').length===1");await waitFor(b,"document.getElementById('closed-room').hidden===false");assert.equal(await b.evaluate("document.getElementById('game').hidden"),true);await b.call('Page.reload');await waitFor(b,"document.getElementById('closed-room').hidden===false");
+  }
+  assert.equal(a.errors.length+b.errors.length+outsider.errors.length,0);console.log(process.env.QUIZ_INVITE_ONLY==='1'?'PASS: room creation, P1 entry, origin-matched P2 invite display/copy and reload recovery; no browser runtime exceptions.':'PASS: named room and P2 invite; two-browser game and mobile layout; P1-only multiple-room list and closure; both exit confirmations and reconnect; P2 closure notice.');if(artifactDir)console.log('Screenshots:',artifactDir);
+}finally{await Promise.all([a.dispose(),b.dispose(),outsider.dispose()]);}

@@ -1,79 +1,69 @@
+import {buildInviteUrl} from './invite-url.mjs';
 const $=id=>document.getElementById(id);
-let identity;
-let pending=false;
-let polling;
-let syncFailed=false;
-const participantStatus=document.createElement('p');participantStatus.id='participants';$('game').prepend(participantStatus);
-async function request(action,extra={},silent=false){
-  if(pending)return;pending=true;if(!silent)$('notice').textContent='처리 중…';
-  try{
-    const r=await fetch('/api/room',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...identity,action,...extra}),signal:AbortSignal.timeout(action==='grade'?70000:15000)});
-    const data=await r.json();
-    if(!r.ok){if(r.status===403){clearInterval(polling);$('game').hidden=true;}throw new Error(data.message);}
-    render(data);$('game').hidden=false;if(!silent||syncFailed)$('notice').textContent='';syncFailed=false;
-  }catch(e){if(silent)syncFailed=true;$('notice').textContent=e.name==='TimeoutError'?'서버 응답이 지연되고 있습니다. 잠시 후 다시 시도해 주세요.':e instanceof TypeError?'서버와 연결할 수 없습니다. 연결 상태를 확인해 주세요.':e.message;}finally{pending=false;}
+let identity,lastState,polling,foreground=false,active=false,connectionError=false,answerRevision=0,answerDirty=false,answerLocal='',answerTimer;
+const newClientId=()=>Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');
+let work=Promise.resolve(),connectionVersion=0,roomListVersion=0;
+function notice(message,tone='success'){$('notice').textContent=message;$('notice').dataset.tone=tone;}
+function element(tag,text,className){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;}
+async function post(path,data){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:AbortSignal.timeout(15000)});let result;try{result=await response.json();}catch{throw new Error('서버 응답을 읽을 수 없습니다. 실행 중인 서버 주소를 확인해 주세요.');}if(!response.ok){const error=new Error(result.message||'요청을 처리하지 못했습니다.');error.status=response.status;error.code=result.code;throw error;}return result;}
+function friendly(error){return error.name==='TimeoutError'?'응답이 늦어지고 있어요. 잠시 후 다시 시도해 주세요.':error instanceof TypeError?'서버와 연결할 수 없어요. 연결 상태를 확인해 주세요.':error.message;}
+function request(action,extra={}){if(!active)return Promise.resolve(false);const version=connectionVersion;if(action==='get'&&foreground)return work;foreground=true;const operation=work.catch(()=>{}).then(async()=>{if(!active||version!==connectionVersion)return false;try{const data=await post('/api/room',{...identity,action,...extra});if(!active||version!==connectionVersion)return false;const recovered=connectionError;connectionError=false;lastState=data;render(data);$('game').hidden=false;const messages={ready:data.phase!=='lobby'?'준비 상태를 저장했어요.':data.participants[data.index].ready?'준비 완료! 상대의 준비를 기다리고 있어요.':'준비를 취소했어요.',startGame:'게임을 시작했어요.',setName:'이름을 저장했어요. 상대가 입장하면 준비 완료를 눌러 주세요.',submitTask:'문제 제출 완료! 답변 단계가 열릴 때까지 기다려 주세요.',startAnswers:'답변 단계로 이동했어요.',submitAnswer:'답안 제출 완료! 상대의 답변을 기다려 주세요.',peer:'채점 완료! 두 사람의 평가가 끝나면 결과를 공개해요.'};if(messages[action])notice(messages[action]);else if(recovered)notice('서버 연결이 복구됐어요.');return true;}catch(error){if(!active||version!==connectionVersion)return false;if(!error.status)connectionError=true;if(error.code==='ROOM_CLOSED')showClosed();else if(error.status===403){stopConnection();$('game').hidden=true;}notice(friendly(error),'error');return false;}});work=operation;return operation.finally(()=>{if(version===connectionVersion)foreground=false;});}
+function setFormValue(form,name,value){const node=$(form)?.elements?.[name];if(node&&document.activeElement!==node)node.value=value??'';}
+function render(data){
+  const index=data.index,me=data.participants[index],other=data.participants[1-index],phase=data.phase;
+  $('room-name').textContent=data.name;$('close-room').hidden=index!==0;$('stage-nav').hidden=false;
+  $('play-area').hidden=phase==='lobby';$('opponent-status').textContent=data.lobby.opponentStatus;
+  $('ready-status').textContent=phase==='lobby'?(!other.online?'상대가 초대 링크로 입장하면 준비를 완료할 수 있어요.':`나: ${me.ready?'준비 완료':'준비 전'} · 상대: ${other.ready?'준비 완료':'준비 전'}`):'게임 진행 내용은 서버에 저장되고 있어요.';
+  $('ready').hidden=phase!=='lobby';$('ready').textContent=me.ready?'준비 취소':'준비 완료';$('ready').setAttribute('aria-pressed',String(me.ready));$('ready').disabled=phase!=='lobby'||!me.online||!other.online||!data.me.name||connectionError;
+  $('start-game').hidden=phase!=='lobby'||index!==0;$('start-game').disabled=phase!=='lobby'||index!==0||!me.online||!other.online||!me.ready||!other.ready;
+  [...$('steps').children].forEach((node,i)=>{node.classList.toggle('done',i<data.stage);if(i===data.stage)node.setAttribute('aria-current','step');else node.removeAttribute('aria-current');});
+  $('participants').replaceChildren(...data.participants.map((p,i)=>{
+    const suffix=i===index?' mine':'';
+    const card=element('article',undefined,'player-card'+suffix);
+    const top=element('div',undefined,'player-top');
+    const title=element('div');
+    title.append(element('p',`참가자 ${i+1} · ${i===index?'나':'상대'}`),element('h3',p.name));
+    top.append(element('span',String(i+1),'avatar'),title,element('span',p.status,'badge'));
+    const line=element('div',undefined,'connection-line');
+    const presenceLabel=p.online?'● 입장 완료':data.startedAt?'○ 재접속 대기 중':'○ 초대 대기 중';
+    const progressLabel=data.phase==='lobby'?(p.ready?'준비 완료':'준비 전'):p.hasEvaluated?'채점 완료':p.hasAnswer?'답변 제출 완료':p.hasTask?'문제 제출 완료':'';
+    line.append(element('span',presenceLabel,p.online?'online':'offline'),element('span',progressLabel));
+    card.append(top,element('p',p.book||'책이 정해지면 표시됩니다','player-book'),element('p',p.range||'독서 범위가 표시됩니다','player-range'),line);
+    return card;
+  }));
+  setFormValue('profile','name',data.me.name);$('profile').hidden=phase!=='lobby';$('profile').querySelector('button').disabled=phase!=='lobby';$('profile-status').textContent=data.me.name?`${data.me.name} 님 · ${data.participants.filter(p=>p.online).length}/2명 접속`:'';
+  const ownTask=data.myTask,otherTask=data.publicTasks[1-index];lock('task',phase!=='problems'||!!ownTask);$('example').hidden=phase!=='problems';if(ownTask)for(const [k,v]of Object.entries(ownTask))setFormValue('task',k,v);
+  $('task-card').hidden=phase!=='problems';$('task-status').textContent=ownTask?'문제 제출 완료 · 내 핵심 답과 채점 기준은 나만 볼 수 있어요.':'';
+  $('task-submit-status').textContent=`P1 ${data.statuses.tasks[0]?'제출 완료':'작성 중'} · P2 ${data.statuses.tasks[1]?'제출 완료':'작성 중'}`;$('start-answers-panel').hidden=phase!=='problems';$('start-answers').disabled=index!==0||!data.statuses.tasks.every(Boolean);
+  $('answer-card').hidden=phase!=='answers';$('reading-book').textContent=otherTask?`${other.name} 님의 질문 · ${otherTask.book} · ${otherTask.range}`:'상대의 질문';$('question').textContent=otherTask?.question||'';
+  const answerGrid=$('answer-grid'),focusedAnswer=document.activeElement?.id?.startsWith('answer-draft-')?document.activeElement.id:null,caret=focusedAnswer?document.activeElement.selectionStart:null;if(phase==='answers'){answerGrid.replaceChildren(...data.answers.map((a,i)=>{const card=element('article',undefined,'answer-person'+(i===index?' mine':''));card.append(element('h3',`P${i+1} · ${data.participants[i].name}`));const form=document.createElement('form');form.id=`answer-${i}`;const label=element('label','답변');const area=document.createElement('textarea');area.id=`answer-draft-${i}`;area.name='draft';area.maxLength=4000;area.placeholder='책의 내용과 근거를 바탕으로 생각을 적어 주세요.';area.value=i===index&&answerDirty?answerLocal:a.draft;area.readOnly=i!==index||a.submitted;label.append(area);form.append(label);const submit=element('button',a.submitted?'답변 제출 완료':'답변 제출하기');submit.type='button';submit.disabled=i!==index||a.submitted||!area.value.trim();form.append(submit);const status=element('p',`P${i+1} ${a.submitted?'답변 제출 완료':'작성 중'}`,'form-status');form.append(status);area.addEventListener('input',()=>{if(i!==index||a.submitted)return;answerLocal=area.value;answerDirty=true;answerRevision=Math.max(Date.now(),answerRevision+1);clearTimeout(answerTimer);answerTimer=setTimeout(()=>saveDraft(area.value),150);submit.disabled=!area.value.trim()||a.submitted;});submit.onclick=async()=>{if(i!==index||!area.value.trim()||submit.disabled)return;clearTimeout(answerTimer);await saveDraft(area.value);submit.disabled=true;await request('submitAnswer',{answer:area.value});answerDirty=false;};card.append(form);return card;}));
+    const own=data.answers[index];answerRevision=Math.max(answerRevision,own.revision||0);if(!answerDirty){const ownArea=$(`answer-${index}`)?.elements.draft;if(ownArea&&document.activeElement!==ownArea)ownArea.value=own.draft;}if(focusedAnswer){const priorIndex=Number(focusedAnswer.slice('answer-draft-'.length));const restored=$(`answer-draft-${priorIndex}`);restored?.focus();if(restored&&Number.isInteger(caret))restored.setSelectionRange(caret,caret);}
+  }else answerGrid.replaceChildren();
+  $('answer-status').textContent=phase==='answers'?`P1 ${data.statuses.answers[0]?'답변 제출 완료':'작성 중'} · P2 ${data.statuses.answers[1]?'답변 제출 완료':'작성 중'}`:'';
+  $('peer-card').hidden=!['grading','results'].includes(phase);$('criteria-content').replaceChildren();if(ownTask)for(const [label,key]of [['내 질문','question'],['핵심 답','core'],['채점 기준','rubric']])$('criteria-content').append(element('strong',label),element('p',ownTask[key]));
+  $('peerAnswer').textContent=phase==='grading'?data.peerAnswer||'':phase==='results'?data.answers[1-index]?.draft||'':'';
+  const evaluationLocked=phase!=='grading'||!!data.participants[index].hasEvaluated,score=$('peer').elements.score,reason=$('peer').elements.reason;score.disabled=reason.disabled=evaluationLocked;const valid=()=>{const raw=score.value;return raw!==''&&/^\d+$/.test(raw)&&Number(raw)>=0&&Number(raw)<=100&&reason.value.trim().length>0;};$('peer').querySelector('button').disabled=evaluationLocked||!valid();score.oninput=reason.oninput=()=>{$('peer').querySelector('button').disabled=evaluationLocked||!valid();};$('peer-status').textContent=phase==='grading'?`P1 ${data.statuses.evaluations[0]?'채점 완료':'채점 중'} · P2 ${data.statuses.evaluations[1]?'채점 완료':'채점 중'}`:'';
+  $('result-card').hidden=phase!=='results';$('results').replaceChildren();if(phase==='results'){const mine=data.results[index],rival=data.results[1-index];$('result').textContent=mine.score===rival.score?'무승부':mine.score>rival.score?'승리':'패배';data.results.forEach((p,i)=>{const card=element('article',undefined,'result-person'),score=element('p',String(p.score),'score');score.append(element('small',' / 100점'));card.append(element('p',i===0?'P1이 받은 점수':'P2가 받은 점수','eyebrow'),element('h3',`P${i+1} · ${p.name}`),score,element('p',p.feedback,'prose'));$('results').append(card);});}
+  $('invite-panel').hidden=index!==0||phase!=='lobby';$('invite-origin').textContent=location.origin;
 }
-function render(d){
-  participantStatus.textContent=`참가자 ${d.index+1} · 참가 ${d.participants}/2명`;
-  $('task').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=!!d.myTask);
-  if(d.myTask)for(const [key,value]of Object.entries(d.myTask))if($('task').elements[key])$('task').elements[key].value=value;
-  $('question').textContent=d.me.task?.question||'상대의 출제를 기다립니다.';
-  $('answer').querySelectorAll('textarea,button').forEach(e=>e.disabled=!d.me.task||!!d.me.answer);
-  if(d.me.answer)$('answer').elements.answer.value=d.me.answer;
-  $('state').textContent=({draft:'제출 전',ready:'답안 저장 완료 · AI 채점 버튼을 눌러 주세요.',processing:'채점 중',waiting:'무료 한도 대기 · 나중에 재시도하세요.',complete:'AI 채점 완료',error:'채점 오류 · 다시 시도하세요.'})[d.me.status];
-  $('grade').disabled=!d.me.answer||['processing','complete'].includes(d.me.status);
-  $('peerAnswer').textContent=d.other.answer||'상대가 아직 답안을 제출하지 않았습니다.';
-  $('peer').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=!d.other.answer||!!d.other.peer);
-  $('ai').replaceChildren();
-  if(d.me.result){const pre=document.createElement('pre');pre.textContent=`AI 총점: ${d.me.result.total}/100\n`+d.me.result.items.map(i=>`${i.criterion}: ${i.score}/${i.max} · ${i.reason}`).join('\n')+`\n잘 이해한 점: ${d.me.result.strengths.join(' / ')}\n놓친 핵심: ${d.me.result.missed.join(' / ')}\n피드백: ${d.me.result.feedback}`;$('ai').append(pre);}else if(d.me.status==='complete')$('ai').textContent='상대 평가 확정 후 AI 결과가 공개됩니다.';
-  if(d.finished){const mine=d.scores[d.index],theirs=d.scores[1-d.index];$('result').textContent=`내 점수 ${mine} · 상대 점수 ${theirs} — ${mine===theirs?'무승부':mine>theirs?'승리':'패배'} (내 상대 평가: ${d.me.peer.score}점 · ${d.me.peer.reason})`;}
-}
-$('create').onclick=async()=>{
-  const button=$('create');
-  if(button.disabled)return;
-  button.disabled=true;button.textContent='대결 만드는 중…';$('notice').textContent='대결을 만들고 있습니다…';
-  try{
-    const r=await fetch('/api/rooms',{method:'POST',signal:AbortSignal.timeout(15000)});
-    let data;
-    try{data=await r.json();}catch{throw new Error('서버 응답을 읽을 수 없습니다. npm start로 실행한 서버에서 접속해 주세요.');}
-    if(!r.ok)throw new Error(data.message||`대결 생성 실패 (HTTP ${r.status})`);
-    if(typeof data.id!=='string'||!data.id||!Array.isArray(data.tokens)||data.tokens.length!==2||data.tokens.some(t=>typeof t!=='string'||!t)||data.tokens[0]===data.tokens[1])throw new Error('서버에서 올바른 참가 링크를 받지 못했습니다. 다시 시도해 주세요.');
-    $('links').replaceChildren();
-    data.tokens.forEach((token,i)=>{
-      const p=document.createElement('p'),a=document.createElement('a');
-      a.href=`/#room=${encodeURIComponent(data.id)}&token=${encodeURIComponent(token)}`;
-      a.textContent=`참가자 ${i+1} 링크`;p.append(a);$('links').append(p);
-    });
-    const p=document.createElement('p');p.textContent='각자 자신의 링크만 사용하세요. 초대 링크를 처음 연 브라우저가 그 자리를 사용합니다. 다른 브라우저로 옮기거나 링크를 공개하지 마세요.';$('links').append(p);
-    $('notice').textContent='대결이 만들어졌습니다. 참가자 링크를 열어 주세요.';
-  }catch(e){
-    $('notice').textContent=e.name==='TimeoutError'?'서버 응답이 지연되고 있습니다. 잠시 후 다시 시도해 주세요.':e instanceof TypeError?'서버에 연결할 수 없습니다. npm start 실행 상태를 확인하고 다시 시도해 주세요.':e.message;
-  }finally{button.disabled=false;button.textContent='대결 만들기';}
-};
-$('task').onsubmit=e=>{e.preventDefault();request('setTask',{task:Object.fromEntries(new FormData(e.target))});};
-$('answer').onsubmit=async e=>{e.preventDefault();await request('submit',{answer:new FormData(e.target).get('answer')});};
-$('peer').onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);request('peer',{score:Number(f.get('score')),reason:f.get('reason')});};
-$('grade').onclick=()=>request('grade');$('refresh').onclick=()=>request('get');
-$('example').onclick=()=>{if($('task').elements.book.disabled)return;const v={book:'가상 단편: 씨앗을 나눈 마을',question:'주인공이 씨앗을 나눈 이유와 마을에 생긴 변화를 설명하세요.',core:'혼자만의 풍작보다 공동체의 생존을 중요하게 여겼다. 씨앗 공유로 협력이 생기고 식량 부족을 함께 해결했다.',rubric:'공동체를 위한 동기 40점, 씨앗 공유와 협력의 인과 관계 40점, 식량 부족 해결 20점.'};for(const[k,x]of Object.entries(v))$('task').elements[k].value=x;};
-async function openParticipant(){
-  const params=new URLSearchParams(location.hash.slice(1));
-  const id=params.get('room'),token=params.get('token');
-  if(!id&&!token)return;
-  $('start').hidden=true;$('game').hidden=true;
-  if(!id||!token){$('notice').textContent='참가 링크가 올바르지 않습니다.';return;}
-  $('notice').textContent='참가 자리를 확인하고 있습니다…';
-  try{
-    // Store before claiming: retries and reloads must present the same browser credential.
-    const key=`reading-quiz:${id}:${token}`;
-    let session=localStorage.getItem(key);
-    if(!session){session=Array.from(crypto.getRandomValues(new Uint8Array(32)),b=>b.toString(16).padStart(2,'0')).join('');localStorage.setItem(key,session);}
-    const r=await fetch('/api/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,token,session}),signal:AbortSignal.timeout(15000)});
-    const data=await r.json();if(!r.ok)throw new Error(data.message);
-    identity={id,session};await request('get');
-    polling=setInterval(()=>{if(!document.hidden)request('get',{},true);},2000);
-  }catch(e){$('notice').textContent=e.name==='SecurityError'?'브라우저 저장소를 사용할 수 없어 참가할 수 없습니다. 저장소 설정을 확인해 주세요.':e.message;}
-}
-// Each participant has a different identity; reload to discard the previous view and requests.
-window.addEventListener('hashchange',()=>location.reload());
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&identity)request('get',{},true);});
+function lock(form,disabled){$(form)?.querySelectorAll('input,textarea,button').forEach(n=>n.disabled=disabled);}
+async function saveDraft(value){if(!active||!identity||lastState?.phase!=='answers'||lastState?.answers?.[lastState.index]?.submitted)return;const revision=Math.max(Date.now(),answerRevision+1);answerRevision=revision;try{await post('/api/room',{...identity,action:'saveAnswerDraft',draft:value,revision});if(answerRevision===revision){answerDirty=false;notice('답안을 자동 저장했어요.');}}catch(error){notice('답안 저장에 실패했어요. 입력은 화면에 남아 있으니 연결 후 다시 시도해 주세요.','error');}}
+async function getInvite(){if(lastState?.index!==0||!identity)return false;$('invite-status').textContent='P2 전용 링크를 불러오는 중…';$('opponent-link').value='';$('copy-opponent').disabled=true;try{const x=await post('/api/room',{...identity,action:'getInvite'});if(typeof x.inviteToken!=='string'||!x.inviteToken)throw new Error('서버가 P2 초대 토큰을 반환하지 않았어요.');$('opponent-link').value=buildInviteUrl(location.origin,identity.id,x.inviteToken);$('copy-opponent').disabled=false;$('invite-status').textContent='상대가 아직 입장하지 않아도 이 링크를 공유할 수 있어요.';return true;}catch(error){$('invite-status').textContent='P2 초대 링크를 불러오지 못했어요. 페이지를 새로고침해 다시 시도해 주세요.';notice(friendly(error),'error');return false;}}
+$('copy-opponent').onclick=async()=>{const link=$('opponent-link').value;if(!link)return;try{await navigator.clipboard.writeText(link);notice('P2 초대 링크를 복사했어요.');}catch{$('opponent-link').focus();$('opponent-link').select();notice('링크를 선택했어요. 복사해 공유해 주세요.');}};
+function savedCredentials(){const result=[];for(let i=0;i<localStorage.length;i++){const key=localStorage.key(i),match=/^reading-quiz:([a-f0-9]{36}):([a-f0-9]{36})$/.exec(key||'');if(match)result.push({id:match[1],token:match[2],session:localStorage.getItem(key)});}return result;}
+async function loadRooms(){const version=++roomListVersion,credentials=savedCredentials();if(!credentials.length){$('my-rooms').hidden=true;return;}try{const result=await post('/api/rooms/list',{credentials});if(version!==roomListVersion||location.hash)return;const list=$('room-list');list.replaceChildren();for(const room of result.rooms){const credential=credentials.find(c=>c.id===room.id);if(!credential)continue;const card=element('article',undefined,'room-entry'),info=element('div'),actions=element('div',undefined,'room-entry-actions'),open=element('button','들어가기'),close=element('button','방 해체','secondary danger');info.append(element('h3',room.name),element('p',`상태: ${{lobby:'초대·준비 대기',problems:'문제 만들기',answers:'답변하기',grading:'서로 평가하기',results:'결과 확인'}[room.phase]||room.phase} · ${room.id.slice(0,6)}`));open.type=close.type='button';open.onclick=()=>{location.href=buildInviteUrl(location.origin,room.id,credential.token);};close.onclick=()=>closeRoom(credential,room.name,close);actions.append(open,close);card.append(info,actions);list.append(card);}$('my-rooms').hidden=list.children.length===0;}catch(error){if(version===roomListVersion)notice(`내 방 목록을 불러오지 못했어요. ${friendly(error)}`,'error');}}
+function showHome(message=''){stopConnection();identity=null;lastState=null;history.replaceState(null,'',location.pathname+location.search);$('game').hidden=true;$('stage-nav').hidden=true;$('closed-room').hidden=true;$('start').hidden=false;$('my-rooms').hidden=true;notice(message);loadRooms();}
+function showClosed(){stopConnection();$('game').hidden=true;$('stage-nav').hidden=true;$('start').hidden=true;$('my-rooms').hidden=true;$('closed-room').hidden=false;}
+async function closeRoom(credential,name,button){if(!confirm(`“${name}” 방을 해체할까요? 상대도 이 방에 다시 입장할 수 없습니다.`))return;button.disabled=true;try{await post('/api/room',{...credential,clientId:identity?.id===credential.id?identity.clientId:newClientId(),action:'closeRoom'});if(identity?.id===credential.id)showHome('방을 해체했어요.');else{await loadRooms();notice('방을 해체했어요.');}}catch(error){if(error.code==='ROOM_CLOSED'){await loadRooms();notice('이미 해체된 방이에요.');}else notice(friendly(error),'error');}finally{button.disabled=false;}}
+$('create-form').onsubmit=async event=>{event.preventDefault();const button=$('create'),name=$('room-name-input').value.trim();if(!name)return;button.disabled=true;try{const data=await post('/api/rooms',{name});if(typeof data.id!=='string'||typeof data.token!=='string'||typeof data.session!=='string'||typeof data.clientId!=='string')throw new Error('방 생성 응답에 P1 입장 정보가 없습니다. 서버를 확인해 주세요.');identity={id:data.id,session:data.session,clientId:data.clientId,index:0,token:data.token};const key=`reading-quiz:${data.id}:${data.token}`;localStorage.setItem(key,data.session);history.replaceState(null,'',buildInviteUrl(location.origin,data.id,data.token));active=true;$('start').hidden=true;$('my-rooms').hidden=true;$('game').hidden=false;$('invite-panel').hidden=false;$('invite-origin').textContent=location.origin;$('invite-status').textContent='P2 전용 링크를 불러오는 중…';const entered=await request('get');const inviteReady=entered&&await getInvite();if(entered)polling=setInterval(()=>request('get'),1800);if(inviteReady)notice(`“${data.name}” 방을 만들었어요. P2 초대 링크를 공유해 주세요.`);}catch(error){notice(friendly(error),'error');}finally{button.disabled=false;}};
+function bindForm(id,action,make){$(id).onsubmit=async e=>{e.preventDefault();const button=e.submitter||e.currentTarget.querySelector('button');if(button.disabled)return;button.disabled=true;try{await request(action,make(new FormData(e.currentTarget)));}finally{if(lastState)render(lastState);}};}
+bindForm('profile','setName',f=>({name:f.get('name')}));bindForm('task','submitTask',f=>({task:Object.fromEntries(f)}));bindForm('peer','peer',f=>({score:Number(f.get('score')),reason:f.get('reason')}));
+$('refresh').onclick=async()=>{if(await request('get'))notice('최신 상태를 확인했어요.');};$('ready').onclick=()=>{if(lastState)$('ready').disabled=true,request('ready',{ready:!lastState.participants[lastState.index].ready});};$('start-game').onclick=()=>request('startGame');
+$('start-answers').onclick=()=>request('startAnswers');
+function stopConnection(){active=false;connectionVersion++;clearInterval(polling);clearTimeout(answerTimer);}
+$('leave').onclick=async()=>{if(!active||!confirm('정말 나가나용?'))return;const area=$(`answer-${lastState?.index}`)?.elements.draft,departing=identity;stopConnection();try{await post('/api/room',{...departing,action:'leave',draft:area?.value||'',revision:answerRevision});showHome('앱을 종료했어요. 같은 링크로 다시 입장할 수 있습니다.');}catch(error){showHome(`앱을 종료했어요. 서버에 종료 상태를 전하지 못했습니다: ${friendly(error)}`);}};
+$('close-room').onclick=()=>{if(active&&identity?.index===0)closeRoom(identity,lastState?.name||'이 방',$('close-room'));};$('closed-home').onclick=()=>showHome();
+$('example').onclick=()=>{if($('example').hidden)return;const sample={book:'가상 단편: 씨앗을 나눈 마을',range:'단편 전체',question:'주인공이 씨앗을 나눈 이유와 마을에 생긴 변화를 설명하세요.',core:'공동체의 생존을 위해 씨앗을 나누었다. 협력을 통해 식량 부족을 함께 해결했다.',rubric:'공동체를 위한 동기 40점 / 씨앗 공유와 협력의 인과 관계 40점 / 식량 부족 해결 20점'};for(const[k,v]of Object.entries(sample))$('task').elements[k].value=v;};
+async function openParticipant(){stopConnection();foreground=false;work=Promise.resolve();const params=new URLSearchParams(location.hash.slice(1)),id=params.get('room'),invite=params.get('token');if(!id&&!invite){loadRooms();return;}$('start').hidden=true;$('my-rooms').hidden=true;if(!id||!invite){showHome();notice('참가 링크가 올바르지 않습니다.','error');return;}try{const key=`reading-quiz:${id}:${invite}`;let session=localStorage.getItem(key);if(!session){session=Array.from(crypto.getRandomValues(new Uint8Array(32)),b=>b.toString(16).padStart(2,'0')).join('');localStorage.setItem(key,session);}const clientId=newClientId();const joined=await post('/api/join',{id,token:invite,session,clientId});identity={id,session,clientId,index:joined.index,token:invite};active=true;if(await request('get')){if(joined.index===0)await getInvite();polling=setInterval(()=>request('get'),1800);notice(`P${joined.index+1} 입장 완료!`);}else if($('closed-room').hidden){const message=$('notice').textContent;showHome();notice(message,'error');}}catch(error){if(error.code==='ROOM_CLOSED')showClosed();else showHome();notice(friendly(error),'error');}}
+window.addEventListener('hashchange',()=>location.reload());window.addEventListener('pagehide',()=>{if(!active||!identity)return;const area=$(`answer-${lastState?.index}`)?.elements.draft,revision=Math.max(answerRevision,Date.now());navigator.sendBeacon('/api/room',new Blob([JSON.stringify({...identity,action:'leave',draft:area?.value||'',revision})],{type:'application/json'}));stopConnection();});window.addEventListener('pageshow',e=>{if(e.persisted)openParticipant();});window.addEventListener('offline',()=>{connectionError=true;notice('서버 연결이 끊겼어요. 재연결 중입니다.','error');});window.addEventListener('online',()=>{if(active)request('get');});
 openParticipant();
